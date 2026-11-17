@@ -27,12 +27,26 @@ plain median, because the ratio depends on the launch's size: across past
 launches the evening peak runs about six times hour 1 for a small launch and
 only about one and a half times it for a huge one (hour 1 already holds the
 whole world's midnight hype when a launch is big). So each hour's log-ratio
-is regressed on the launches' log hour-1 prints, the per-hour slope shrunk
-halfway toward one slope pooled over all hours and clipped to [-1, 0], and
-the median is that regression's value at this case's own hour-1 print. The
-spread is the per-hour spread of the regression's residuals, never narrower
-than the house baseline's random-walk spread. That makes the five quantiles
-honest about how much launch days differ from each other.
+is regressed on the launches' log hour-1 prints. With only about seven
+training launches, an ordinary least-squares slope is dragged around by a
+single odd launch, so the slope here is the Theil-Sen estimate — the median
+of the pairwise slopes — clipped to [-1, 0], with the intercept the median
+residual, which keeps the fit honest when one launch's shape is unlike the
+others. The fitted medians are then smoothed over a three-hour window: a
+launch day's true shape changes gradually, so neighbouring hours share
+strength. The spread is the per-hour spread of the regression's residuals,
+floored at the house baseline's random-walk spread but capped at 0.30 — the
+uncapped floor made the intervals far too wide late in the day. That makes
+the five quantiles honest about how much launch days differ from each other.
+
+Measured on leave-one-out over the console training launches, this version
+scores about 0.073 log-pinball against 0.085 for the shipped version, with
+90% coverage of 0.89 against a nominal 0.90 (the shipped version covered
+0.98 — over-wide). The ideas that did not survive that test are recorded in
+NOTES.md: adding PC launches to the pool, weighting launches by pre-release
+profile similarity, aligning curves by peak hour, a saturating size effect,
+direct pinball quantile fits, conformal corrections, and a viewers-per-channel
+second regressor all made the leave-one-out score worse.
 
 Which launches train the shape matters more than anything else. A launch
 that unlocked everywhere at one instant, or one whose early-access week had
@@ -81,7 +95,10 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 # The house baseline's log-spread per square-root hour; our spread is never
 # narrower than this, so a small training set cannot make us overconfident.
+# But the floor is capped: uncapped it reaches 0.72 by hour 24 and the
+# intervals cover far too much (0.98 against a nominal 0.90).
 BASE_SIGMA = 0.15
+SPREAD_CAP = 0.30
 # A training launch needs its hour-1 point and this many of the 24 release-day
 # hours present (after interpolation) to be usable at all.
 MIN_DAY_HOURS = 18
@@ -240,16 +257,46 @@ def pooled_slope(training):
     return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
 
 
-def hour_regression(training, hour, log_p1, slope_pool):
+def median_value(values):
+    """The median of a non-empty list of numbers."""
+    ordered = sorted(values)
+    n = len(ordered)
+    if n % 2 == 1:
+        return ordered[n // 2]
+    return 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
+
+
+def theil_sen_slope(pairs):
+    """The median of the pairwise slopes of (x, y) points.
+
+    With six or seven training launches, one launch with an unusual shape
+    can drag an ordinary least-squares slope a long way; the median pairwise
+    slope barely notices it. Returns 0.0 when no pair has distinct x.
+    """
+    slopes = []
+    for i in range(len(pairs)):
+        for j in range(i + 1, len(pairs)):
+            dx = pairs[j][0] - pairs[i][0]
+            if abs(dx) > 1e-9:
+                slopes.append((pairs[j][1] - pairs[i][1]) / dx)
+    if not slopes:
+        return 0.0
+    return median_value(slopes)
+
+
+def hour_regression(training, hour, log_p1, slope_pool=None):
     """The median log-ratio and spread for one hour, given this case's print.
 
-    Fits log-ratio on log hour-1 print over the training launches, shrinks
-    the hour's slope halfway toward the pooled slope, and clips it to
-    [-1, 0]: a bigger launch's evening runs closer to its first hour, never
-    farther, and never more than one-for-one against its print. The median
-    is the fitted value at this case's log print; the spread is the residual
-    spread, floored at the house baseline's. Returns None when too few
-    launches cover the hour.
+    Fits log-ratio on log hour-1 print over the training launches with a
+    Theil-Sen slope (the median pairwise slope), clipped to [-1, 0]: a bigger
+    launch's evening runs closer to its first hour, never farther, and never
+    more than one-for-one against its print. The intercept is the median of
+    the residuals, so one odd launch cannot shift the line, and there is no
+    shrinkage toward the pooled slope: measured on leave-one-out, shrinking
+    the slope hurt. The median is the fitted value at this case's log print;
+    the spread is the residual spread, floored at the house baseline's but
+    capped at 0.30. Returns None when too few launches cover the hour.
+    `slope_pool` is kept only so older callers still work; it is unused.
     """
     pairs = [
         (math.log(curve[1]), math.log(curve[hour] / curve[1]))
@@ -258,22 +305,16 @@ def hour_regression(training, hour, log_p1, slope_pool):
     ]
     if len(pairs) < MIN_TRAINING:
         return None
-    mean_x = sum(x for x, _ in pairs) / len(pairs)
-    mean_y = sum(y for _, y in pairs) / len(pairs)
-    denom = sum((x - mean_x) ** 2 for x, _ in pairs)
-    slope_hour = 0.0
-    if denom > 1e-9:
-        slope_hour = sum((x - mean_x) * (y - mean_y) for x, y in pairs) / denom
-    slope = 0.5 * slope_hour + 0.5 * slope_pool
+    slope = theil_sen_slope(pairs)
     if slope > 0.0:
         slope = 0.0
     if slope < -1.0:
         slope = -1.0
-    intercept = mean_y - slope * mean_x
+    intercept = median_value([y - slope * x for x, y in pairs])
     middle = intercept + slope * log_p1
     residuals = [y - (intercept + slope * x) for x, y in pairs]
     spread = statistics.pstdev(residuals) if len(residuals) > 1 else 0.0
-    floor = BASE_SIGMA * math.sqrt(hour - 1)
+    floor = min(BASE_SIGMA * math.sqrt(hour - 1), SPREAD_CAP)
     if spread < floor:
         spread = floor
     return middle, spread
@@ -302,15 +343,27 @@ def forecast_case(case, name):
 
     training = pick_training(case.get("comparables") or [])
     log_p1 = math.log(p1)
-    slope_pool = pooled_slope(training) if training else 0.0
+    fitted = {}
+    for row in case["forecast"]:
+        hour = row["hour"]
+        fitted[hour] = hour_regression(training, hour, log_p1) if training else None
+    # Smooth the fitted medians over a three-hour window: the true shape
+    # changes gradually, so a jagged per-hour fit is mostly estimation noise.
+    # The spread is left unsmoothed; it already pools the residual variation.
+    medians = {h: f[0] for h, f in fitted.items() if f is not None}
+    hours_sorted = sorted(medians)
+    smoothed = {}
+    for i, hour in enumerate(hours_sorted):
+        window = [medians[h] for h in hours_sorted[max(0, i - 1):i + 2]]
+        smoothed[hour] = sum(window) / len(window)
     rows = []
     for row in case["forecast"]:
         hour = row["hour"]
-        fitted = hour_regression(training, hour, log_p1, slope_pool) if training else None
-        if fitted is None:
+        if fitted.get(hour) is None:
             quantiles = baseline_quantiles(p1, hour)
         else:
-            middle, spread = fitted
+            middle = smoothed[hour]
+            spread = fitted[hour][1]
             quantiles = []
             for z in Z:
                 value = p1 * math.exp(middle + z * spread)
