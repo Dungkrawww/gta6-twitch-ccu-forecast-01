@@ -18,11 +18,16 @@ level; the shape comes from past launches that unlocked the same way.
 
 `main.py` (Python 3.13, standard library only) reads a case, rebuilds each
 comparable launch's release-day curve, and forecasts each hour as hour 1's
-print times the median ratio across the training launches, with a spread from
-how much those launches disagree — never narrower than the house baseline's
-random-walk spread. The training set is console-only, rolling-midnight
-launches (no PC, no simultaneous global unlock, no early-access contamination),
-with fallbacks to wider sets when too few qualify.
+print times a ratio predicted from those launches — not their plain median,
+because the ratio depends on the launch's size: across past launches the
+evening peak runs about six times hour 1 for a small launch and only about
+one and a half times it for a huge one. Each hour's log-ratio is regressed
+on the launches' log hour-1 prints (slope shrunk toward one pooled slope,
+clipped to [-1, 0]), and the spread comes from the regression's residuals,
+never narrower than the house baseline's random-walk spread. The training
+set is console-only, rolling-midnight launches (no PC, no simultaneous
+global unlock, no early-access contamination), with fallbacks to wider sets
+when too few qualify.
 
 ## Run it
 
@@ -37,6 +42,6 @@ hours 2..24. Deterministic — two runs on the same case write the same bytes.
 ## Validation
 
 Leave-one-out over the kit's comparable launches: on console-only,
-rolling-midnight launches the model scores a mean pinball loss of ~0.22
+rolling-midnight launches the model scores a mean pinball loss of ~0.17
 against the house persistence baseline's ~0.37 (both measured on the same
 interpolated curves; the official practice grade is computed server-side).

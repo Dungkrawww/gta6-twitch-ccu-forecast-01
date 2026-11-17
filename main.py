@@ -22,10 +22,17 @@ the level; the shape comes from past launches that unlocked the same way.
 For every comparable launch we rebuild its release-day curve (log viewers
 interpolated between its hourly points) and take, per hour h, the ratio of
 that hour's viewers to its own hour-1 print. The forecast median for hour h
-is hour 1's print times the median ratio across the training launches; the
-spread is the per-hour spread of those log-ratios, never narrower than the
-house baseline's random-walk spread. That makes the five quantiles honest
-about how much launch days differ from each other.
+is hour 1's print times a ratio predicted from those launches — not their
+plain median, because the ratio depends on the launch's size: across past
+launches the evening peak runs about six times hour 1 for a small launch and
+only about one and a half times it for a huge one (hour 1 already holds the
+whole world's midnight hype when a launch is big). So each hour's log-ratio
+is regressed on the launches' log hour-1 prints, the per-hour slope shrunk
+halfway toward one slope pooled over all hours and clipped to [-1, 0], and
+the median is that regression's value at this case's own hour-1 print. The
+spread is the per-hour spread of the regression's residuals, never narrower
+than the house baseline's random-walk spread. That makes the five quantiles
+honest about how much launch days differ from each other.
 
 Which launches train the shape matters more than anything else. A launch
 that unlocked everywhere at one instant, or one whose early-access week had
@@ -208,15 +215,68 @@ def pick_training(comps):
     return []
 
 
-def median(values):
-    """The median of a non-empty sorted list (linear interpolation)."""
-    ordered = sorted(values)
-    n = len(ordered)
-    mid = (n - 1) / 2.0
-    lo = int(mid)
-    hi = min(lo + 1, n - 1)
-    frac = mid - lo
-    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+def pooled_slope(training):
+    """One log-ratio-on-log-print slope pooled over every (launch, hour).
+
+    The size effect is one pattern, not twenty-three separate ones, so a
+    single slope over all hours is the stable estimate; the per-hour slopes
+    are shrunk toward it below. Returns 0.0 when the prints do not vary.
+    """
+    xs = []
+    ys = []
+    for curve in training:
+        log_p1 = math.log(curve[1])
+        for hour in range(2, 25):
+            if hour in curve:
+                xs.append(log_p1)
+                ys.append(math.log(curve[hour] / curve[1]))
+    if len(xs) < 2:
+        return 0.0
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if denom < 1e-9:
+        return 0.0
+    return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+
+
+def hour_regression(training, hour, log_p1, slope_pool):
+    """The median log-ratio and spread for one hour, given this case's print.
+
+    Fits log-ratio on log hour-1 print over the training launches, shrinks
+    the hour's slope halfway toward the pooled slope, and clips it to
+    [-1, 0]: a bigger launch's evening runs closer to its first hour, never
+    farther, and never more than one-for-one against its print. The median
+    is the fitted value at this case's log print; the spread is the residual
+    spread, floored at the house baseline's. Returns None when too few
+    launches cover the hour.
+    """
+    pairs = [
+        (math.log(curve[1]), math.log(curve[hour] / curve[1]))
+        for curve in training
+        if hour in curve and 1 in curve
+    ]
+    if len(pairs) < MIN_TRAINING:
+        return None
+    mean_x = sum(x for x, _ in pairs) / len(pairs)
+    mean_y = sum(y for _, y in pairs) / len(pairs)
+    denom = sum((x - mean_x) ** 2 for x, _ in pairs)
+    slope_hour = 0.0
+    if denom > 1e-9:
+        slope_hour = sum((x - mean_x) * (y - mean_y) for x, y in pairs) / denom
+    slope = 0.5 * slope_hour + 0.5 * slope_pool
+    if slope > 0.0:
+        slope = 0.0
+    if slope < -1.0:
+        slope = -1.0
+    intercept = mean_y - slope * mean_x
+    middle = intercept + slope * log_p1
+    residuals = [y - (intercept + slope * x) for x, y in pairs]
+    spread = statistics.pstdev(residuals) if len(residuals) > 1 else 0.0
+    floor = BASE_SIGMA * math.sqrt(hour - 1)
+    if spread < floor:
+        spread = floor
+    return middle, spread
 
 
 def round_half_up_2dp(x):
@@ -241,38 +301,29 @@ def forecast_case(case, name):
     p1 = max(1.0, float(first["viewers"]))
 
     training = pick_training(case.get("comparables") or [])
+    log_p1 = math.log(p1)
+    slope_pool = pooled_slope(training) if training else 0.0
     rows = []
     for row in case["forecast"]:
         hour = row["hour"]
-        if not training:
+        fitted = hour_regression(training, hour, log_p1, slope_pool) if training else None
+        if fitted is None:
             quantiles = baseline_quantiles(p1, hour)
         else:
-            log_ratios = sorted(
-                math.log(curve[hour] / curve[1])
-                for curve in training
-                if hour in curve and 1 in curve
-            )
-            if len(log_ratios) < MIN_TRAINING:
-                quantiles = baseline_quantiles(p1, hour)
-            else:
-                middle = median(log_ratios)
-                spread = statistics.pstdev(log_ratios)
-                floor = BASE_SIGMA * math.sqrt(hour - 1)
-                if spread < floor:
-                    spread = floor
-                quantiles = []
-                for z in Z:
-                    value = p1 * math.exp(middle + z * spread)
-                    if value < 1.0:
-                        value = 1.0
-                    if value > 1e9:
-                        value = 1e9
-                    quantiles.append(round_half_up_2dp(value))
-                # Rounding can only keep the order (exp is monotone), but
-                # enforce it outright so the row is valid whatever happens.
-                for i in range(1, len(quantiles)):
-                    if quantiles[i] < quantiles[i - 1]:
-                        quantiles[i] = quantiles[i - 1]
+            middle, spread = fitted
+            quantiles = []
+            for z in Z:
+                value = p1 * math.exp(middle + z * spread)
+                if value < 1.0:
+                    value = 1.0
+                if value > 1e9:
+                    value = 1e9
+                quantiles.append(round_half_up_2dp(value))
+            # Rounding can only keep the order (exp is monotone), but
+            # enforce it outright so the row is valid whatever happens.
+            for i in range(1, len(quantiles)):
+                if quantiles[i] < quantiles[i - 1]:
+                    quantiles[i] = quantiles[i - 1]
         rows.append({"hour": hour, "q": quantiles})
     rows.sort(key=lambda r: r["hour"])
     return {"hours": rows}
